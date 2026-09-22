@@ -887,6 +887,8 @@ dependencies = [
  "clap",
  "evalexpr",
  "futures-util",
+ "git-credential-nostr",
+ "git-sign-nostr",
  "hex",
  "httparse",
  "nix 0.31.3",
@@ -896,6 +898,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite 0.29.0",
@@ -905,6 +908,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -1158,8 +1162,6 @@ dependencies = [
  "base64 0.22.1",
  "buzz-cli",
  "buzz-core",
- "git-credential-nostr",
- "git-sign-nostr",
  "ignore",
  "image",
  "nix 0.31.3",
@@ -1177,7 +1179,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows-sys 0.61.2",
- "zeroize",
 ]
 
 [[package]]
