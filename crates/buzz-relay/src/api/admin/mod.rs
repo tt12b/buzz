@@ -1549,7 +1549,12 @@ mod postgres_tests {
     }
 
     async fn disabled_mode_state() -> Arc<crate::state::AppState> {
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+        // hermetic_for_test_with_db_from_env: NIP-FI env isolation preserved;
+        // database_url overridden from CI/local-dev env chain so postgres_tests
+        // that seed rows via database_url() match the pool the handler queries.
+        // Falls back to the port-1 stub when neither env var is set (unit tests
+        // that do not touch the DB continue to fail-closed correctly). [F6, admin-DB]
+        let mut config = crate::config::Config::hermetic_for_test_with_db_from_env();
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.admin = Some(crate::config::AdminConfig {
@@ -2158,7 +2163,7 @@ mod postgres_tests {
     /// Build an AppState that uses a real Postgres connection pool so HTTP
     /// routes that hit the DB can commit and read back results.
     async fn nip98_state_with_real_pool(pool: sqlx::PgPool) -> Arc<crate::state::AppState> {
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+        let mut config = crate::config::Config::hermetic_for_test();
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.relay_operator_pubkeys = vec![test_operator_keys().public_key().to_hex()];
@@ -2914,7 +2919,12 @@ mod postgres_tests {
         pubkeys: Vec<String>,
         replay: Arc<dyn buzz_auth::Nip98ReplayGuard>,
     ) -> Arc<crate::state::AppState> {
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+        // hermetic_for_test_with_db_from_env: NIP-FI env isolation preserved;
+        // database_url overridden from CI/local-dev env chain so postgres_tests
+        // that seed rows via database_url() (e.g. unban/untimeout tests) match
+        // the pool the admin HTTP routes query. Fails closed to port-1 when no
+        // env var is set. [F6, admin-DB]
+        let mut config = crate::config::Config::hermetic_for_test_with_db_from_env();
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         // Populate relay_operator_pubkeys so resolve_admin_principal can grant
@@ -3412,7 +3422,7 @@ mod postgres_tests {
     #[tokio::test]
     async fn probe_in_nip98_mode_with_owner_fallback_b_returns_operator_role() {
         let owner_keys = nostr::Keys::generate();
-        let mut config = crate::config::Config::from_env().expect("default config");
+        let mut config = crate::config::Config::hermetic_for_test();
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         // Empty operator list — activates fallback B.
@@ -3489,7 +3499,7 @@ mod postgres_tests {
         let owner_hex = owner_keys.public_key().to_hex();
         let owner_bytes = owner_keys.public_key().to_bytes().to_vec();
 
-        let mut config = crate::config::Config::from_env().expect("default config");
+        let mut config = crate::config::Config::hermetic_for_test();
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.relay_operator_pubkeys = vec![]; // activates owner fallback B
@@ -3616,7 +3626,10 @@ mod postgres_tests {
 
         // Inject RELAY_OWNER_PUBKEY into the state config manually.
         // We need a fresh state with both set.
-        let mut config = crate::config::Config::from_env().expect("default config");
+        // hermetic_for_test_with_db_from_env: this test does a real DB lookup for
+        // resolve_admin_principal (owner fallback path); the pool must point at the
+        // live test DB, not the port-1 hermetic stub. [F6, admin-DB, probe-owner]
+        let mut config = crate::config::Config::hermetic_for_test_with_db_from_env();
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.relay_operator_pubkeys = vec![other_operator.public_key().to_hex()];
@@ -3986,7 +3999,7 @@ mod postgres_tests {
         let target_keys = nostr::Keys::generate();
         let target_hex = target_keys.public_key().to_hex();
         // Put target in config — makes it config-backed and immutable.
-        let mut config = crate::config::Config::from_env().expect("default config");
+        let mut config = crate::config::Config::hermetic_for_test();
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.relay_operator_pubkeys =
@@ -4059,7 +4072,7 @@ mod postgres_tests {
         let operator_keys = nostr::Keys::generate();
         let target_keys = nostr::Keys::generate();
         let target_hex = target_keys.public_key().to_hex();
-        let mut config = crate::config::Config::from_env().expect("default config");
+        let mut config = crate::config::Config::hermetic_for_test();
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.relay_operator_pubkeys =
@@ -4130,7 +4143,7 @@ mod postgres_tests {
         // Owner fallback B: RELAY_OPERATOR_PUBKEYS empty, owner key is implicit operator.
         let owner_keys = nostr::Keys::generate();
         let owner_hex = owner_keys.public_key().to_hex();
-        let mut config = crate::config::Config::from_env().expect("default config");
+        let mut config = crate::config::Config::hermetic_for_test();
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.relay_operator_pubkeys = vec![]; // activates fallback B
@@ -5838,7 +5851,7 @@ mod postgres_tests {
     /// Build an AppState wired to the given pool. Used by the e2e driver tests so
     /// they share the same DB connection the test fixtures wrote to.
     async fn state_from_pool(pool: sqlx::PgPool) -> Arc<crate::state::AppState> {
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+        let mut config = crate::config::Config::hermetic_for_test();
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.admin = Some(crate::config::AdminConfig {
@@ -7454,16 +7467,21 @@ mod postgres_tests {
         let conn_id = uuid::Uuid::new_v4();
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(1);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = tokio::sync::mpsc::channel(1);
+        let reg_cancel = tokio_util::sync::CancellationToken::new();
+        let reg_control = crate::state::CommunityConnectionControl::new(reg_cancel.clone());
         state.conn_manager.register(
             conn_id,
             tx,
             ctrl_tx,
+            terminal_ctrl_tx,
             None,
-            tokio_util::sync::CancellationToken::new(),
+            reg_cancel,
             cid,
             std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             3,
+            reg_control,
         );
         state
             .conn_manager
@@ -9142,16 +9160,21 @@ mod postgres_tests {
         let conn_id = uuid::Uuid::new_v4();
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(1);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = tokio::sync::mpsc::channel(1);
+        let reg_cancel = tokio_util::sync::CancellationToken::new();
+        let reg_control = crate::state::CommunityConnectionControl::new(reg_cancel.clone());
         state.conn_manager.register(
             conn_id,
             tx,
             ctrl_tx,
+            terminal_ctrl_tx,
             None,
-            tokio_util::sync::CancellationToken::new(),
+            reg_cancel,
             cid,
             std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             3,
+            reg_control,
         );
         state
             .conn_manager
@@ -9407,16 +9430,21 @@ mod postgres_tests {
         let conn_id = uuid::Uuid::new_v4();
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(1);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = tokio::sync::mpsc::channel(1);
+        let reg_cancel = tokio_util::sync::CancellationToken::new();
+        let reg_control = crate::state::CommunityConnectionControl::new(reg_cancel.clone());
         state.conn_manager.register(
             conn_id,
             tx,
             ctrl_tx,
+            terminal_ctrl_tx,
             None,
-            tokio_util::sync::CancellationToken::new(),
+            reg_cancel,
             cid,
             std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             3,
+            reg_control,
         );
         state
             .conn_manager
@@ -10282,16 +10310,21 @@ mod postgres_tests {
         let conn_id = uuid::Uuid::new_v4();
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(1);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = tokio::sync::mpsc::channel(1);
+        let reg_cancel = tokio_util::sync::CancellationToken::new();
+        let reg_control = crate::state::CommunityConnectionControl::new(reg_cancel.clone());
         state.conn_manager.register(
             conn_id,
             tx,
             ctrl_tx,
+            terminal_ctrl_tx,
             None,
-            tokio_util::sync::CancellationToken::new(),
+            reg_cancel,
             cid,
             std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             3,
+            reg_control,
         );
         state
             .conn_manager
@@ -10542,16 +10575,21 @@ mod postgres_tests {
         let conn_id = uuid::Uuid::new_v4();
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(1);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = tokio::sync::mpsc::channel(1);
+        let reg_cancel = tokio_util::sync::CancellationToken::new();
+        let reg_control = crate::state::CommunityConnectionControl::new(reg_cancel.clone());
         state.conn_manager.register(
             conn_id,
             tx,
             ctrl_tx,
+            terminal_ctrl_tx,
             None,
-            tokio_util::sync::CancellationToken::new(),
+            reg_cancel,
             cid,
             std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             3,
+            reg_control,
         );
         state
             .conn_manager
@@ -10740,16 +10778,21 @@ mod postgres_tests {
         let conn_id = uuid::Uuid::new_v4();
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(1);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = tokio::sync::mpsc::channel(1);
+        let reg_cancel = tokio_util::sync::CancellationToken::new();
+        let reg_control = crate::state::CommunityConnectionControl::new(reg_cancel.clone());
         state.conn_manager.register(
             conn_id,
             tx,
             ctrl_tx,
+            terminal_ctrl_tx,
             None,
-            tokio_util::sync::CancellationToken::new(),
+            reg_cancel,
             cid,
             std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             3,
+            reg_control,
         );
         state
             .conn_manager
