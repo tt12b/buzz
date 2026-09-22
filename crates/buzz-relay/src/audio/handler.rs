@@ -9715,16 +9715,437 @@ mod tests {
         );
     }
 
-    // ── CommitConfirmed send timeout (Item 2): never-completing send exits ─────
+    // ── CommitConfirmed send timeout (Item 2): production-seam witness ──────────
     //
-    // A mock MeshStream-like scenario: if the CommitConfirmed send hangs due to
-    // flow control, COMMIT_CONFIRM_SEND_TIMEOUT must fire and confirm_send_failed
-    // must be true. This is validated by the tokio::time::timeout wrapping the
-    // send_frame call in handle_active_audio_connection.
+    // Drives `handle_active_audio_connection` through the REAL cross-pod path
+    // with a scripted owner transport whose `send_frame` stalls after
+    // `PeerRegistered` — the exact seam where `COMMIT_CONFIRM_SEND_TIMEOUT`
+    // must fire at handler.rs:1282.
     //
-    // We test the timeout constant and the timeout pattern via the send_loop
-    // rather than the full handler (which requires a live AppState + DB).
-    // The never-ready-sink witnesses below cover the exact same mechanism.
+    // ## Schedule
+    //
+    // 1. `FakeRemoteDirectory::owner_of` returns a DIFFERENT runtime_id →
+    //    `resolve_join_owner_ready` → `JoinOutcome::RemoteOwner`.
+    // 2. `dial_remote_owner` calls `transport.open_session_stream` →
+    //    `ScriptedTransport` returns a `StagedMeshStream`:
+    //      - send call 1 (RegisterPeer): succeeds immediately.
+    //      - recv call 1 (PeerRegistered): returns a valid scripted response.
+    //      - send call 2 (CommitConfirmed at handler.rs:1282): returns
+    //        `std::future::pending()` forever (stalled owner stream).
+    // 3. `commit_participant_join` DB commit succeeds → `after_participant_fanout`
+    //    hook fires → test waits → releases → handler attempts CommitConfirmed
+    //    send → stalls → `COMMIT_CONFIRM_SEND_TIMEOUT` (5 s) fires → teardown
+    //    arm runs → peer removed from room.
+    //
+    // Assertion: the room has NO committed peer after the handler exits, proving
+    // the teardown arm ran. The outer test timeout (30 s) bounds the whole run,
+    // so a hang is a test-level timeout (RED).
+    //
+    // ## Mutation oracle (P3)
+    //
+    // Remove `tokio::time::timeout(COMMIT_CONFIRM_SEND_TIMEOUT, ...)` at
+    // handler.rs:1282 → `stream.send_frame(CommitConfirmed)` is awaited directly
+    // → `StagedMeshHalfSend` returns `pending()` forever → handler hangs past
+    // 30 s → outer `tokio::time::timeout` fires → test RED.
+    //
+    // This is the seam-level witness Paul's P3 mutation demanded: deleting the
+    // production timeout at :1282 makes this test go red.
+    #[tokio::test]
+    #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+    async fn commit_confirm_timeout_at_seam_triggers_teardown_on_stalled_owner_stream() {
+        use buzz_auth::VerifiedAssertion;
+        use buzz_relay_mesh::wire::FencedHeader;
+        use buzz_relay_mesh::MeshError;
+        use chrono::{Duration, Utc};
+        use futures_util::StreamExt as _;
+        use std::sync::{
+            atomic::{AtomicU8, Ordering},
+            Arc,
+        };
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::connect_async;
+
+        use crate::audio::join::{
+            AcquireOutcome, HuddleDirectory, HuddleLease, HuddleOwnerRegistry,
+            HuddleReleaseOutcome, HuddleRenewOutcome, Ownership, RosterSnapshot,
+        };
+        use buzz_core::CommunityId;
+        use buzz_relay_mesh::{
+            BoxFuture, InboundHandler, MeshDatagram, MeshStream, MeshStreamFrame,
+            RelayPeerTransport, RuntimeId, StreamHello, StreamRecvHalf, StreamSendHalf,
+        };
+        use uuid::Uuid;
+
+        // ── Scripted owner stream: succeeds on RegisterPeer dial, stalls on CommitConfirmed ──
+        //
+        // send counter:
+        //   0 → RegisterPeer (succeed, counter → 1)
+        //   1+ → CommitConfirmed / clean-close frames (return pending())
+        // recv counter:
+        //   0 → PeerRegistered response (counter → 1)
+        //   1+ → pending()
+
+        struct StagedMeshHalfSend {
+            send_count: Arc<AtomicU8>,
+        }
+        impl StreamSendHalf for StagedMeshHalfSend {
+            fn send_frame(
+                &mut self,
+                _frame: MeshStreamFrame,
+            ) -> BoxFuture<'_, Result<(), MeshError>> {
+                let n = self.send_count.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // First call: RegisterPeer send — succeed immediately.
+                    Box::pin(async { Ok(()) })
+                } else {
+                    // All subsequent calls (CommitConfirmed, UnregisterPeer,
+                    // Goodbye): stall indefinitely, simulating a full flow-control
+                    // window or an owner that stopped reading.
+                    Box::pin(std::future::pending())
+                }
+            }
+            fn finish(&mut self) -> Result<(), MeshError> {
+                Ok(())
+            }
+        }
+
+        struct StagedMeshHalfRecv {
+            recv_count: Arc<AtomicU8>,
+            registered_frame: Vec<u8>,
+            fenced: FencedHeader,
+        }
+        impl StreamRecvHalf for StagedMeshHalfRecv {
+            fn recv_frame(&mut self) -> BoxFuture<'_, Result<Option<MeshStreamFrame>, MeshError>> {
+                let n = self.recv_count.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // First call: PeerRegistered response.
+                    let payload = self.registered_frame.clone();
+                    let fenced = self.fenced;
+                    Box::pin(async move { Ok(Some(MeshStreamFrame::Data { fenced, payload })) })
+                } else {
+                    // All subsequent calls: stall (owner stops writing).
+                    Box::pin(std::future::pending())
+                }
+            }
+        }
+
+        // ScriptedTransport: returns one staged stream per `open_session_stream`
+        // call. The stream is pre-loaded with a valid `PeerRegistered` payload.
+        struct ScriptedTransport {
+            peer_registered_payload: Vec<u8>,
+            fenced: FencedHeader,
+            send_count: Arc<AtomicU8>,
+            recv_count: Arc<AtomicU8>,
+        }
+        impl RelayPeerTransport for ScriptedTransport {
+            fn send_datagram(&self, _to: RuntimeId, _dgram: MeshDatagram) -> Result<(), MeshError> {
+                Ok(())
+            }
+            fn open_session_stream(
+                &self,
+                _to: RuntimeId,
+                _hello: StreamHello,
+            ) -> BoxFuture<'_, Result<MeshStream, MeshError>> {
+                let payload = self.peer_registered_payload.clone();
+                let fenced = self.fenced;
+                let send_count = Arc::clone(&self.send_count);
+                let recv_count = Arc::clone(&self.recv_count);
+                // The pubkey in StagedMeshHalfSend is unused for framing
+                // (it only drives PeerRegistered; the actual pubkey comes from
+                // the handler's fixture).
+                Box::pin(async move {
+                    let stream = MeshStream::new(
+                        Box::new(StagedMeshHalfSend { send_count }),
+                        Box::new(StagedMeshHalfRecv {
+                            recv_count,
+                            registered_frame: payload,
+                            fenced,
+                        }),
+                    );
+                    Ok(stream)
+                })
+            }
+            fn set_inbound(&self, _handler: Box<dyn InboundHandler>) {}
+        }
+
+        // FakeRemoteDirectory: owner_of returns a DIFFERENT runtime_id so the
+        // handler resolves RemoteOwner → dial_remote_owner → scripted transport.
+        struct FakeRemoteDirectory {
+            remote_runtime_id: RuntimeId,
+            generation: u64,
+        }
+        #[async_trait::async_trait]
+        impl HuddleDirectory for FakeRemoteDirectory {
+            async fn owner_of(
+                &self,
+                _community_id: CommunityId,
+                _session_id: Uuid,
+            ) -> Result<Option<Ownership>, MeshError> {
+                Ok(Some(Ownership {
+                    owner_runtime_id: self.remote_runtime_id,
+                    generation: self.generation,
+                }))
+            }
+            async fn acquire(
+                &self,
+                _c: CommunityId,
+                _s: Uuid,
+                _owner: RuntimeId,
+            ) -> Result<AcquireOutcome, MeshError> {
+                unreachable!("FakeRemoteDirectory: acquire not called on RemoteOwner path")
+            }
+            async fn renew(&self, _lease: &HuddleLease) -> Result<HuddleRenewOutcome, MeshError> {
+                unreachable!("FakeRemoteDirectory: renew not called on RemoteOwner path")
+            }
+            async fn release(
+                &self,
+                _lease: &HuddleLease,
+            ) -> Result<HuddleReleaseOutcome, MeshError> {
+                unreachable!("FakeRemoteDirectory: release not called on RemoteOwner path")
+            }
+            async fn validate(&self, _c: CommunityId, _f: &FencedHeader) -> Result<(), MeshError> {
+                // Scripted validate: always passes fence check.
+                Ok(())
+            }
+        }
+
+        // ── Setup ──────────────────────────────────────────────────────────
+        let state = audio_test_state_real_db()
+            .await
+            .expect("CommitConfirm-seam: PostgreSQL must be available");
+        let pool = state.db.pool().clone();
+        let (tenant, channel_id, member_key) = seed_audio_fixture(&pool).await;
+        let community = tenant.community();
+        let tenant_host = tenant.host().to_string();
+
+        let member_hex = member_key.public_key().to_hex();
+        let assertion = VerifiedAssertion::for_test(
+            Some(member_key.public_key()),
+            vec![Utc::now() + Duration::hours(1)],
+        );
+
+        // ── Build mesh with scripted remote transport ──────────────────────
+        let owners = Arc::new(HuddleOwnerRegistry::new());
+        let mut mesh = crate::mesh_boot::MeshHandle::for_test_only(Arc::clone(&owners)).await;
+
+        // A remote runtime_id distinct from the local one → RemoteOwner verdict.
+        let remote_runtime_id = RuntimeId([1u8; 32]);
+        let remote_generation: u64 = 77;
+
+        let fenced = FencedHeader {
+            owner_runtime_id: remote_runtime_id,
+            session_id: channel_id,
+            generation: remote_generation,
+        };
+
+        // Build the scripted PeerRegistered payload the owner would return.
+        let peer_registered_payload = crate::audio::join::encode_control(
+            &crate::audio::join::HuddleControlMsg::PeerRegistered {
+                pubkey: member_hex.clone(),
+                peer_index: 1,
+                epoch: 1,
+                roster: RosterSnapshot {
+                    revision: 1,
+                    peers: vec![],
+                },
+            },
+        )
+        .expect("CommitConfirm-seam: encode PeerRegistered");
+
+        let send_count = Arc::new(AtomicU8::new(0));
+        let recv_count = Arc::new(AtomicU8::new(0));
+        mesh.transport = Arc::new(ScriptedTransport {
+            peer_registered_payload,
+            fenced,
+            send_count: Arc::clone(&send_count),
+            recv_count: Arc::clone(&recv_count),
+        });
+        let mesh = mesh.with_test_directory(Arc::new(FakeRemoteDirectory {
+            remote_runtime_id,
+            generation: remote_generation,
+        }));
+
+        state
+            .mesh
+            .set(mesh)
+            .map_err(|_| ())
+            .expect("CommitConfirm-seam: mesh OnceLock already set — state must be fresh");
+
+        // ── Pre-arm after_participant_fanout hook ──────────────────────────
+        // Fires after commit_participant_join completes its DB write + broadcast,
+        // just before returning CommitJoinOutcome::JoinedSent. The handler then
+        // tries CommitConfirmed send (the stalled seam).
+        let (fanout_rx, fanout_release) =
+            crate::nip_fi_test_hooks::audio_participant_fanout_hook::arm(community);
+
+        // ── Wire server ────────────────────────────────────────────────────
+        let conn_cancel = tokio_util::sync::CancellationToken::new();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let state_c = Arc::clone(&state);
+        let tenant_c = tenant.clone();
+        let assertion_c = assertion.clone();
+        let conn_cancel_c = conn_cancel.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("CommitConfirm-seam: bind listener");
+        let addr = listener
+            .local_addr()
+            .expect("CommitConfirm-seam: local addr");
+
+        let server = tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::get({
+                    let state_i = Arc::clone(&state_c);
+                    let tenant_i = tenant_c.clone();
+                    let assertion_i = assertion_c.clone();
+                    let cancel_i = conn_cancel_c.clone();
+                    move |ws: axum::extract::ws::WebSocketUpgrade| {
+                        let state_i = Arc::clone(&state_i);
+                        let tenant_i = tenant_i.clone();
+                        let assertion_i = assertion_i.clone();
+                        let conn_time = chrono::Utc::now();
+                        let control_inner =
+                            crate::state::CommunityConnectionControl::new(cancel_i.clone());
+                        async move {
+                            ws.on_upgrade(move |socket| async move {
+                                handle_active_audio_connection(
+                                    socket,
+                                    state_i,
+                                    tenant_i,
+                                    channel_id,
+                                    control_inner,
+                                    Some(assertion_i),
+                                    conn_time,
+                                    None,
+                                )
+                                .await
+                            })
+                        }
+                    }
+                }),
+            );
+            let _ = ready_tx.send(());
+            axum::serve(listener, app)
+                .await
+                .expect("CommitConfirm-seam: test server");
+        });
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+            .await
+            .expect("CommitConfirm-seam: server ready");
+
+        let (mut client, _) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("CommitConfirm-seam: connect");
+
+        // ── NIP-42 handshake ───────────────────────────────────────────────
+        let challenge_msg = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+            .await
+            .expect("CommitConfirm-seam: challenge timeout")
+            .expect("CommitConfirm-seam: challenge msg")
+            .expect("CommitConfirm-seam: challenge ws msg");
+        let challenge_text = match challenge_msg {
+            tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+            other => panic!("CommitConfirm-seam: expected text challenge; got {other:?}"),
+        };
+        let challenge_json: serde_json::Value =
+            serde_json::from_str(&challenge_text).expect("CommitConfirm-seam: challenge JSON");
+        let challenge = challenge_json["challenge"]
+            .as_str()
+            .expect("CommitConfirm-seam: challenge field")
+            .to_string();
+
+        let relay_url = format!("ws://{tenant_host}");
+        let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
+            .tag(nostr::Tag::parse(["relay", &relay_url]).unwrap())
+            .tag(nostr::Tag::parse(["challenge", &challenge]).unwrap())
+            .sign_with_keys(&member_key)
+            .unwrap();
+        let auth_msg = serde_json::json!({
+            "type": "auth",
+            "event": auth_event,
+            "parent_channel_id": null,
+            "protocol_version": 2,
+        })
+        .to_string();
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                auth_msg.into(),
+            ))
+            .await
+            .expect("CommitConfirm-seam: send auth");
+
+        // ── Wait for after_participant_fanout — DB commit done ─────────────
+        tokio::time::timeout(std::time::Duration::from_secs(10), fanout_rx)
+            .await
+            .expect("CommitConfirm-seam: handler must reach after_participant_fanout within 10s")
+            .expect("CommitConfirm-seam: fanout channel closed");
+
+        // Release hook → commit_participant_join returns JoinedSent → handler
+        // attempts CommitConfirmed send → stalls on StagedMeshHalfSend →
+        // COMMIT_CONFIRM_SEND_TIMEOUT (5s) fires → teardown arm runs.
+        fanout_release.notify_one();
+
+        // ── Assert: handler exits within COMMIT_CONFIRM_SEND_TIMEOUT +
+        // CLEAN_CLOSE_SEND_TIMEOUT + buffer (5 + 2 + 3 = 10s) ──────────────
+        // The WS closes when the handler returns; client.next() returns None.
+        // This outer timeout is the mutation oracle: P3 (remove the production
+        // timeout at handler.rs:1282) makes the handler hang past this bound.
+        let handler_exited = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(msg) = client.next().await {
+                match msg {
+                    Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => return true,
+                    Err(_) => return true,
+                    _ => {}
+                }
+            }
+            true // stream exhausted = connection closed
+        })
+        .await;
+
+        assert!(
+            handler_exited.is_ok(),
+            "CommitConfirm-seam: handler must exit within 10s after hook release.\n\
+             COMMIT_CONFIRM_SEND_TIMEOUT (5s) + CLEAN_CLOSE_SEND_TIMEOUT (2s) + 3s buffer.\n\
+             Mutation oracle P3: remove `tokio::time::timeout(COMMIT_CONFIRM_SEND_TIMEOUT, \
+             stream.send_frame(...))` at handler.rs:1282 → send_frame(CommitConfirmed) awaited \
+             directly → StagedMeshHalfSend returns `pending()` forever → handler hangs past 10s \
+             → outer timeout fires → RED"
+        );
+
+        // ── Assert: teardown arm ran — peer removed from the room ─────────
+        let room_snapshot = state
+            .audio_rooms
+            .get(community, channel_id)
+            .map(|r| r.roster_snapshot());
+        if let Some(snap) = room_snapshot {
+            assert!(
+                snap.peers.iter().all(|p| p.pubkey != member_hex),
+                "CommitConfirm-seam: confirm-failed teardown must remove the peer from the room.\n\
+                 Mutation oracle P3: without the production timeout, teardown never runs → \
+                 peer stays committed → this assertion panics.\n\
+                 Got peers: {:?}",
+                snap.peers.iter().map(|p| &p.pubkey).collect::<Vec<_>>()
+            );
+        }
+
+        // Send count must be ≥ 2: RegisterPeer (count 0) + CommitConfirmed (count 1).
+        // Verifies the scripted transport was exercised through the commit-confirm seam
+        // (not an earlier rejection path).
+        let sends = send_count.load(Ordering::SeqCst);
+        assert!(
+            sends >= 2,
+            "CommitConfirm-seam: ScriptedTransport must have seen ≥ 2 send calls \
+             (RegisterPeer + CommitConfirmed attempt); got {sends}.\n\
+             If sends == 1, the handler exited before reaching the CommitConfirmed seam \
+             (e.g. rejected at dial_remote_owner or admission)."
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
 
     // ── Audio never-ready-sink witnesses (Item 3) ────────────────────────────
     //
@@ -9871,23 +10292,15 @@ mod tests {
         );
     }
 
-    // ── CommitConfirmed send timeout (Item 2): mesh send_frame never completes ─
+    // ── CommitConfirmed send timeout (Item 2): mechanism sanity check ─────────
     //
-    // Verifies that `COMMIT_CONFIRM_SEND_TIMEOUT` fires when `stream.send_frame`
-    // blocks indefinitely (peer never reads, flow-control window full). The
-    // production code at handler.rs:1282 wraps the cross-pod CommitConfirmed
-    // send in `tokio::time::timeout(COMMIT_CONFIRM_SEND_TIMEOUT, ...)`.
+    // Secondary check that `tokio::time::timeout` fires on a `pending()` send.
+    // The seam-level witness is `commit_confirm_timeout_at_seam_triggers_teardown_on_stalled_owner_stream`
+    // (postgres lane) — that test drives the real production path and its P3
+    // mutation turns it RED when the production timeout is removed.
     //
-    // Approach: build a `MeshStream` whose send half always returns
-    // `std::future::pending()`. Wrap `stream.send_frame(...)` in a short
-    // `tokio::time::timeout(...)` — same expression shape as production — and
-    // assert `Elapsed`. This directly exercises the timeout mechanism.
-    //
-    // ## Mutation oracle
-    //
-    // Remove the `tokio::time::timeout(COMMIT_CONFIRM_SEND_TIMEOUT, ...)` wrapper
-    // at handler.rs:1282 → `stream.send_frame(...)` is awaited directly → the
-    // future never resolves → the test task hangs forever → RED.
+    // This unit test confirms the `tokio::time::timeout + pending()` mechanism
+    // is available and works in the test runtime. It is not a seam witness.
     #[tokio::test]
     async fn commit_confirm_send_timeout_fires_on_never_completing_mesh_send() {
         use buzz_relay_mesh::{
