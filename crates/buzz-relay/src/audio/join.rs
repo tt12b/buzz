@@ -789,7 +789,7 @@ impl HuddleOwnerRegistry {
     /// tests that exercise the fan-out to the control loop / WS peers in
     /// isolation from the (separately tested) renewer timing.
     #[cfg(test)]
-    fn install_for_test(&self, session_id: Uuid, generation: u64) -> CancellationToken {
+    pub(crate) fn install_for_test(&self, session_id: Uuid, generation: u64) -> CancellationToken {
         let lost = CancellationToken::new();
         self.entries.insert(
             session_id,
@@ -801,6 +801,20 @@ impl HuddleOwnerRegistry {
             },
         );
         lost
+    }
+
+    /// Return the generation stored for `session_id`, or `None` if absent.
+    /// Used by caller-schedule tests to verify the entry's generation without
+    /// accessing the private `entries` map directly.
+    #[cfg(test)]
+    pub(crate) fn generation_for(&self, session_id: Uuid) -> Option<u64> {
+        self.entries.get(&session_id).map(|e| e.generation)
+    }
+
+    /// Return `true` if there is a live entry for `session_id`.
+    #[cfg(test)]
+    pub(crate) fn has_entry(&self, session_id: Uuid) -> bool {
+        self.entries.contains_key(&session_id)
     }
 }
 
@@ -883,6 +897,20 @@ pub enum HuddleControlMsg {
     /// Non-owner → owner: the local client left; drop its remote peer.
     UnregisterPeer {
         /// Pubkey of the departing client.
+        pubkey: String,
+    },
+    /// Non-owner → owner: the ingress DB transaction for `pubkey` committed
+    /// successfully. The owner should now publish the peer's admission (mark
+    /// committed, bump roster revision, fire the joined delta and broadcast).
+    ///
+    /// Sent by the ingress in the `Ok(JoinedSent)` arm of
+    /// `commit_participant_join`, immediately after the DB commit. If this
+    /// message is never received (stream close before confirm) the owner
+    /// treats the pending slot as rolled back and removes it silently on
+    /// stream teardown — the peer was never visible to anyone.
+    /// [Fix B: FI-TRACE-COMMIT-BEFORE-PUBLISH]
+    CommitConfirmed {
+        /// Pubkey the confirmation is for.
         pubkey: String,
     },
 }
@@ -1114,6 +1142,9 @@ impl<D: HuddleDirectory + ?Sized> HuddleControlAcceptor<D> {
     /// same authoritative room-empty teardown as the local owner WebSocket
     /// path. The owner-registry release is generation-fenced, so a late close
     /// from an old stream cannot cancel a newly acquired lease epoch.
+    ///
+    /// **Only call for committed peers.** For pending (uncommitted) slots use
+    /// [`Self::remove_remote_peer_pending`].
     fn remove_remote_peer(
         &self,
         community: CommunityId,
@@ -1128,6 +1159,27 @@ impl<D: HuddleDirectory + ?Sized> HuddleControlAcceptor<D> {
             return;
         };
         broadcast_peer_left(&room, delta, session_id);
+        if should_end && self.rooms.cleanup_if_empty(community, session_id) {
+            self.owners.release(session_id, generation);
+        }
+    }
+
+    /// Like [`Self::remove_remote_peer`] but for pending (uncommitted) slots.
+    /// No delta is broadcast; no revision bump. The room-empty / lease-release
+    /// logic still runs so an empty room whose only peer was pending does not
+    /// linger.
+    /// [Fix B: FI-TRACE-COMMIT-BEFORE-PUBLISH]
+    fn remove_remote_peer_pending(
+        &self,
+        community: CommunityId,
+        session_id: Uuid,
+        generation: u64,
+        peer_id: Uuid,
+    ) {
+        let Some(room) = self.rooms.get(community, session_id) else {
+            return;
+        };
+        let (_, should_end) = room.remove_peer_silent_and_check_ended(peer_id);
         if should_end && self.rooms.cleanup_if_empty(community, session_id) {
             self.owners.release(session_id, generation);
         }
@@ -1164,6 +1216,12 @@ impl<D: HuddleDirectory + ?Sized> HuddleControlAcceptor<D> {
         let session_id = fenced.session_id;
         // pubkey -> peer_id, for UnregisterPeer and teardown on stream close.
         let mut registered: std::collections::HashMap<String, Uuid> =
+            std::collections::HashMap::new();
+        // pubkey -> peer_id for peers admitted but not yet commit-confirmed.
+        // On CommitConfirmed: move to `registered` + commit_peer + broadcast.
+        // On stream close without confirm: remove_remote_peer silently.
+        // [Fix B: FI-TRACE-COMMIT-BEFORE-PUBLISH]
+        let mut pending_registered: std::collections::HashMap<String, Uuid> =
             std::collections::HashMap::new();
         // Community (raw UUID) latched from the first RegisterPeer; every later
         // frame must agree. `None` until the first register arrives.
@@ -1304,7 +1362,7 @@ impl<D: HuddleDirectory + ?Sized> HuddleControlAcceptor<D> {
                             from,
                             &pubkey,
                             protocol_version,
-                            &mut registered,
+                            &mut pending_registered,
                         ),
                         Err(e) => match FenceRejection::from_mesh_error(&e) {
                             Some(reason) => HuddleControlMsg::RegisterRejected {
@@ -1328,6 +1386,10 @@ impl<D: HuddleDirectory + ?Sized> HuddleControlAcceptor<D> {
                     }
                 }
                 HuddleControlMsg::UnregisterPeer { pubkey } => {
+                    // Peer may be pending (commit not yet received) or
+                    // committed. Remove from whichever map holds it, using
+                    // the correct removal path to preserve the invariant:
+                    // committed → emits left delta; pending → silent removal.
                     if let Some(peer_id) = registered.remove(&pubkey) {
                         if let Some(community_id) = stream_community {
                             self.remove_remote_peer(
@@ -1337,7 +1399,58 @@ impl<D: HuddleDirectory + ?Sized> HuddleControlAcceptor<D> {
                                 peer_id,
                             );
                         }
+                    } else if let Some(peer_id) = pending_registered.remove(&pubkey) {
+                        if let Some(community_id) = stream_community {
+                            self.remove_remote_peer_pending(
+                                CommunityId::from_uuid(community_id),
+                                session_id,
+                                fenced.generation,
+                                peer_id,
+                            );
+                        }
                     }
+                }
+                HuddleControlMsg::CommitConfirmed { pubkey } => {
+                    // The ingress DB transaction for `pubkey` committed. Move
+                    // the slot from `pending_registered` to `registered`, then
+                    // call `commit_peer` to publish the admission (mark
+                    // committed, bump revision, fire the joined delta and
+                    // broadcast `joined` to all local peers).
+                    // [Fix B: FI-TRACE-COMMIT-BEFORE-PUBLISH]
+                    if let Some(peer_id) = pending_registered.remove(&pubkey) {
+                        registered.insert(pubkey.clone(), peer_id);
+                        if let Some(community_id) = stream_community {
+                            let community = CommunityId::from_uuid(community_id);
+                            if let Some(room) = self.rooms.get(community, session_id) {
+                                // commit_peer atomically marks committed, bumps
+                                // the revision, and fires the roster_tx delta.
+                                if let Some(roster_revision) = room.commit_peer(peer_id) {
+                                    // Read peer fields after commit_peer — the peer
+                                    // is now committed so `peers.get` will not race
+                                    // with `roster_snapshot` producing an empty view.
+                                    if let Some(peer_entry) = room.peers.get(&peer_id) {
+                                        let peer_index = peer_entry.peer_index;
+                                        let epoch = peer_entry.epoch;
+                                        drop(peer_entry);
+                                        let joined = serde_json::json!({
+                                            "type": "joined",
+                                            "revision": roster_revision,
+                                            "pubkey": pubkey,
+                                            "peer_index": peer_index,
+                                            "epoch": epoch,
+                                            "peers": room.roster_snapshot().peers.iter().map(|p| {
+                                                serde_json::json!({"pubkey": p.pubkey, "peer_index": p.peer_index, "epoch": p.epoch})
+                                            }).collect::<Vec<_>>(),
+                                        })
+                                        .to_string();
+                                        room.broadcast_control(joined);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // If peer_id not found: already removed (rollback arrived
+                    // before confirm, or never admitted) — no-op.
                 }
                 HuddleControlMsg::RosterResync => {
                     let Some(room) = stream_community.and_then(|community_id| {
@@ -1384,12 +1497,26 @@ impl<D: HuddleDirectory + ?Sized> HuddleControlAcceptor<D> {
             for (_pubkey, peer_id) in registered {
                 self.remove_remote_peer(community, session_id, fenced.generation, peer_id);
             }
+            // Pending peers (commit never arrived): remove silently.
+            // They were never visible — no `joined` was published.
+            // Using remove_remote_peer_pending so no delta/revision bump fires.
+            // [Fix B: FI-TRACE-COMMIT-BEFORE-PUBLISH]
+            for (_pubkey, peer_id) in pending_registered {
+                self.remove_remote_peer_pending(community, session_id, fenced.generation, peer_id);
+            }
         }
         result
     }
 
-    /// Admit one remote client into the owner's room and wire its fan-out back
-    /// to the registering pod as datagrams. Returns the reply to send.
+    /// Admit one remote client into the owner's room as a pending slot, and
+    /// wire its media fan-out back to the registering pod as datagrams.
+    /// Returns the reply to send.
+    ///
+    /// The peer is admitted with `committed = false`. The joined delta and
+    /// `broadcast_control` are deferred until `CommitConfirmed` arrives from
+    /// the ingress (after its DB transaction commits). If the stream closes
+    /// before confirmation, the pending slot is removed silently on teardown.
+    /// [Fix B: FI-TRACE-COMMIT-BEFORE-PUBLISH]
     fn register_remote_peer(
         &self,
         room: Arc<Room>,
@@ -1397,25 +1524,18 @@ impl<D: HuddleDirectory + ?Sized> HuddleControlAcceptor<D> {
         from: RuntimeId,
         pubkey: &str,
         protocol_version: u8,
-        registered: &mut std::collections::HashMap<String, Uuid>,
+        pending_registered: &mut std::collections::HashMap<String, Uuid>,
     ) -> HuddleControlMsg {
-        match room.add_peer(pubkey.to_string(), protocol_version) {
-            Ok((peer_id, peer_index, epoch, audio_rx, _peer_ctrl_rx, roster_revision)) => {
-                registered.insert(pubkey.to_string(), peer_id);
-                // The owner's Room fans out to this remote peer's `audio_tx`;
-                // the sink drains `audio_rx` and ships each frame as a datagram
-                // to the pod that hosts the client.
+        match room.add_peer_pending(pubkey.to_string(), protocol_version) {
+            Ok((peer_id, peer_index, epoch, audio_rx, _peer_ctrl_rx, _snapshot_revision)) => {
+                pending_registered.insert(pubkey.to_string(), peer_id);
+                // Wire the owner's Room fan-out back to the registering pod.
+                // The sink drains `audio_rx` and ships each frame as a datagram.
                 spawn_remote_peer_sink(Arc::clone(&self.transport), from, fenced, audio_rx);
-                let joined = serde_json::json!({
-                    "type": "joined",
-                    "revision": roster_revision,
-                    "pubkey": pubkey,
-                    "peer_index": peer_index,
-                    "epoch": epoch,
-                    "peers": [{"pubkey": pubkey, "peer_index": peer_index, "epoch": epoch}],
-                })
-                .to_string();
-                room.broadcast_control(joined);
+                // Return PeerRegistered carrying the allocated index and the
+                // current committed roster (excludes this pending peer, which
+                // is not yet committed). The ingress uses the index for media
+                // forwarding and sends CommitConfirmed when its DB tx commits.
                 HuddleControlMsg::PeerRegistered {
                     pubkey: pubkey.to_string(),
                     peer_index,
@@ -1836,6 +1956,54 @@ impl RemoteHuddleSession {
             debug!(owner = %self.owner, "huddle media datagram to owner failed: {e}");
         }
     }
+
+    /// Construct a minimal `RemoteHuddleSession` for handler-level tests.
+    /// Fields not relevant to the test path (transport, seq, protocol_version)
+    /// are zeroed. Only `fenced` and `pubkey` are used by `send_clean_close`,
+    /// which is the only method CW7 exercises on this type.
+    #[cfg(test)]
+    pub fn for_test(fenced: FencedHeader, pubkey: String) -> Self {
+        use std::sync::Arc;
+        struct NullTransport;
+        impl buzz_relay_mesh::RelayPeerTransport for NullTransport {
+            fn send_datagram(
+                &self,
+                _to: buzz_relay_mesh::RuntimeId,
+                _dgram: buzz_relay_mesh::MeshDatagram,
+            ) -> Result<(), buzz_relay_mesh::MeshError> {
+                Ok(())
+            }
+            fn open_session_stream(
+                &self,
+                _to: buzz_relay_mesh::RuntimeId,
+                _hello: buzz_relay_mesh::wire::StreamHello,
+            ) -> buzz_relay_mesh::BoxFuture<
+                '_,
+                Result<buzz_relay_mesh::MeshStream, buzz_relay_mesh::MeshError>,
+            > {
+                Box::pin(async {
+                    Err(buzz_relay_mesh::MeshError::PeerNotConnected(
+                        buzz_relay_mesh::RuntimeId([0u8; 32]),
+                    ))
+                })
+            }
+            fn set_inbound(&self, _handler: Box<dyn buzz_relay_mesh::InboundHandler>) {}
+        }
+        Self {
+            peer_index: 0,
+            epoch: 0,
+            protocol_version: 1,
+            roster: RosterSnapshot {
+                peers: vec![],
+                revision: 0,
+            },
+            fenced,
+            owner: fenced.owner_runtime_id,
+            pubkey,
+            transport: Arc::new(NullTransport),
+            seq: 0,
+        }
+    }
 }
 
 /// Unregister the client from the owner and close the control stream cleanly.
@@ -2173,6 +2341,9 @@ mod tests {
             HuddleControlMsg::UnregisterPeer {
                 pubkey: "abc123".into(),
             },
+            HuddleControlMsg::CommitConfirmed {
+                pubkey: "abc123".into(),
+            },
         ] {
             let bytes = encode_control(&msg).unwrap();
             assert_eq!(decode_control(&bytes).unwrap(), msg);
@@ -2414,7 +2585,30 @@ mod tests {
             .await
             .unwrap();
         let _registered = client.recv_frame().await.unwrap().unwrap();
-        let joined = local_ctrl_rx.recv().await.expect("remote join fanout");
+
+        // Fix-B contract: RegisterPeer places the peer in pending_registered —
+        // no `joined` is broadcast until CommitConfirmed arrives.
+        assert!(
+            local_ctrl_rx.try_recv().is_err(),
+            "pending RegisterPeer must not fan out a joined message"
+        );
+
+        // CommitConfirmed: triggers commit_peer → broadcast_control(joined).
+        client
+            .send_frame(MeshStreamFrame::Data {
+                fenced,
+                payload: encode_control(&HuddleControlMsg::CommitConfirmed {
+                    pubkey: "remote".into(),
+                })
+                .unwrap(),
+            })
+            .await
+            .unwrap();
+
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(2), local_ctrl_rx.recv())
+            .await
+            .expect("joined fanout must arrive within 2s after CommitConfirmed")
+            .expect("local ctrl channel must not close before joined");
         let super::super::room::PeerCtrl::Json(joined) = joined else {
             panic!("expected joined JSON");
         };
@@ -2436,6 +2630,60 @@ mod tests {
         assert_eq!(left["type"], "left");
         assert_eq!(left["pubkey"], "remote");
         assert_eq!(left["peer_index"], remote_index);
+        assert_eq!(room.peer_pubkeys(), vec![("owner-local".into(), 0)]);
+    }
+
+    /// Under Fix-B, a remote peer whose control stream closes before
+    /// `CommitConfirmed` arrives is silently removed from `pending_registered`.
+    /// The local owner-pod peer must see no `joined` and no `left` — the slot
+    /// was never published.
+    #[tokio::test]
+    async fn pending_remote_stream_close_emits_no_joined_no_left() {
+        let owner_rt = rt(1);
+        let from = rt(2);
+        let session_id = Uuid::new_v4();
+        let fenced = fenced_owned_by(owner_rt, session_id);
+        let rooms = Arc::new(AudioRoomManager::new());
+        let room = rooms.get_or_create(community(), session_id);
+        let (_local_id, _local_index, _epoch, _audio_rx, mut local_ctrl_rx, _revision) =
+            room.add_peer("owner-local".into(), 2).unwrap();
+
+        let acceptor = HuddleControlAcceptor::new(
+            Arc::clone(&rooms),
+            Arc::new(NullTransport) as Arc<dyn RelayPeerTransport>,
+            Arc::new(FakeDir::default()),
+            owner_rt,
+            Arc::new(HuddleOwnerRegistry::new()),
+        );
+        let (owner_stream, mut client) = stream_pair();
+        let hello = huddle_hello(from, fenced);
+        let served =
+            tokio::spawn(async move { acceptor.accept_inbound(from, hello, owner_stream).await });
+
+        client
+            .send_frame(MeshStreamFrame::Data {
+                fenced,
+                payload: encode_control(&HuddleControlMsg::RegisterPeer {
+                    community_id: *community().as_uuid(),
+                    pubkey: "remote-pending".into(),
+                    protocol_version: 2,
+                })
+                .unwrap(),
+            })
+            .await
+            .unwrap();
+        let _registered = client.recv_frame().await.unwrap().unwrap();
+
+        // Close the stream without sending CommitConfirmed.
+        drop(client);
+        served.await.unwrap().unwrap();
+
+        // The pending slot must be silently removed: no joined, no left.
+        assert!(
+            local_ctrl_rx.try_recv().is_err(),
+            "pending close before CommitConfirmed must not fan out joined or left"
+        );
+        // The peer slot must be fully cleaned up (not visible in the room).
         assert_eq!(room.peer_pubkeys(), vec![("owner-local".into(), 0)]);
     }
 
@@ -3195,5 +3443,228 @@ mod tests {
             }
             other => panic!("expected Goodbye(SessionEnded), got {other:?}"),
         }
+    }
+
+    /// Fix 7 / F7b: `HuddleOwnerRegistry::release` is generation-fenced.
+    ///
+    /// When a pending peer fails and the room becomes empty,
+    /// `commit_participant_join`'s error paths call
+    /// `mesh.owners.release(channel_id, generation)`.  A stale call with
+    /// the wrong generation must NOT cancel the renewer, so a newer epoch that
+    /// a re-acquire installed after room-empty is not torn down.  A call with
+    /// the correct generation MUST cancel the renewer (releasing the lease
+    /// cleanly) and remove the entry.
+    ///
+    /// ## Mutation oracle
+    ///
+    /// A) Remove the `entry.generation == generation` guard from
+    ///    `HuddleOwnerRegistry::release` → the stale-generation call cancels
+    ///    the entry → `registry.entries.get(&session_id_1).is_some()` panics
+    ///    (entry removed by the wrong caller).
+    ///
+    /// B) Replace the `release` body with a no-op → the correct-generation
+    ///    call has no effect → `registry.entries.get(&session_id_2).is_none()`
+    ///    panics (entry still present after correct release).
+    #[tokio::test]
+    async fn f7b_owner_registry_release_is_generation_fenced() {
+        let registry = HuddleOwnerRegistry::new();
+
+        let session_id_1 = Uuid::new_v4();
+        let session_id_2 = Uuid::new_v4();
+
+        // ── Install entry 1 (generation 10) ──────────────────────────────────
+        let dir_1 = Arc::new(FakeDir::with_renew_script(
+            [HuddleRenewOutcome::Renewed(lease_for(session_id_1, 10))],
+            HuddleReleaseOutcome::Released,
+        ));
+        let lease_1 = lease_for(session_id_1, 10);
+        let _signals_1 = registry.attach_signals(session_id_1, dir_1, lease_1);
+
+        // ── Install entry 2 (generation 5) ───────────────────────────────────
+        let dir_2 = Arc::new(FakeDir::with_renew_script(
+            [HuddleRenewOutcome::Renewed(lease_for(session_id_2, 5))],
+            HuddleReleaseOutcome::Released,
+        ));
+        let lease_2 = lease_for(session_id_2, 5);
+        let _signals_2 = registry.attach_signals(session_id_2, dir_2, lease_2);
+
+        assert_eq!(registry.entries.len(), 2, "both entries installed");
+
+        // ── Stale release: wrong generation for session_1 ────────────────────
+        registry.release(session_id_1, 99); // wrong generation — must be a no-op
+        assert!(
+            registry.entries.get(&session_id_1).is_some(),
+            "F7b: release with wrong generation must NOT remove the entry; \
+             stale teardown tore down a live epoch\n\
+             Mutation oracle A: remove the generation guard from `release` → panics"
+        );
+
+        // ── Correct release: right generation for session_2 ──────────────────
+        registry.release(session_id_2, 5);
+        tokio::task::yield_now().await; // let spawned renewer see cancellation
+        assert!(
+            registry.entries.get(&session_id_2).is_none(),
+            "F7b: release with correct generation must remove the entry\n\
+             Mutation oracle B: no-op `release` body → entry stays → panics"
+        );
+
+        // ── session_1's entry must be unaffected ─────────────────────────────
+        assert!(
+            registry.entries.get(&session_id_1).is_some(),
+            "F7b: releasing session_2 must not affect session_1's entry"
+        );
+
+        // Cleanup
+        registry.release(session_id_1, 10);
+    }
+
+    // ── Fix-B witness: CommitConfirmed arm in serve_control_loop ─────────────
+    //
+    // RegisterPeer places the ingress peer in `pending_registered`. When the
+    // ingress sends `CommitConfirmed`, `serve_control_loop` must:
+    //   1. Call `room.commit_peer(peer_id)` — marks committed, bumps revision,
+    //      fires the roster delta.
+    //   2. Call `room.broadcast_control(joined)` — fans out the `joined` JSON
+    //      to all local committed peers.
+    //
+    // This test drives the full `accept_inbound` path: RegisterPeer → pending →
+    // CommitConfirmed → commit_peer → broadcast. An owner-local Alice observer
+    // receives the `joined` broadcast and the delta channel sees exactly one
+    // event with a revision strictly greater than the pre-admission snapshot.
+    //
+    // ## Mutation oracle
+    //
+    // A) Comment out `room.commit_peer(peer_id)` in the `CommitConfirmed` arm
+    //    of `serve_control_loop` (join.rs) → delta never fires → `delta_rx.recv()`
+    //    on a timeout returns None → assertion panics.
+    // B) Comment out `room.broadcast_control(joined)` in the same arm →
+    //    Alice's `ctrl_rx.recv()` returns None (timeout) → assertion panics.
+    //
+    // No Postgres required; uses the in-memory `stream_pair()` transport.
+    #[tokio::test]
+    async fn fix_b_commit_confirmed_arm_commits_peer_and_broadcasts_joined() {
+        let owner_rt = rt(1);
+        let from = rt(2);
+        let session_id = Uuid::new_v4();
+        let fenced = fenced_owned_by(owner_rt, session_id);
+        let rooms = Arc::new(AudioRoomManager::new());
+
+        // Alice: owner-local committed peer; subscribes to both the roster delta
+        // channel and her own ctrl channel to receive the broadcast.
+        let room = rooms.get_or_create(community(), session_id);
+        let (alice_id, _, _, _, mut alice_ctrl_rx, _) = room.add_peer("alice".into(), 2).unwrap();
+        room.mark_committed(alice_id);
+        // Subscribe to roster deltas AFTER alice's join to start clean.
+        let mut delta_rx = room.subscribe_roster();
+        let _ = delta_rx.try_recv(); // drain alice's own join delta
+
+        let pre_bob_revision = room.roster_snapshot().revision;
+
+        let acceptor = HuddleControlAcceptor::new(
+            Arc::clone(&rooms),
+            Arc::new(NullTransport) as Arc<dyn RelayPeerTransport>,
+            Arc::new(FakeDir::default()),
+            owner_rt,
+            Arc::new(HuddleOwnerRegistry::new()),
+        );
+
+        let (owner_stream, mut client) = stream_pair();
+        let hello = huddle_hello(from, fenced);
+        let served =
+            tokio::spawn(async move { acceptor.accept_inbound(from, hello, owner_stream).await });
+
+        // RegisterPeer: puts bob in pending_registered, returns PeerRegistered.
+        client
+            .send_frame(MeshStreamFrame::Data {
+                fenced,
+                payload: encode_control(&HuddleControlMsg::RegisterPeer {
+                    community_id: *community().as_uuid(),
+                    pubkey: "bob".into(),
+                    protocol_version: 2,
+                })
+                .unwrap(),
+            })
+            .await
+            .unwrap();
+        let registered = client.recv_frame().await.unwrap().unwrap();
+        assert!(
+            matches!(registered, MeshStreamFrame::Data { .. }),
+            "expected PeerRegistered reply"
+        );
+
+        // No delta before CommitConfirmed — pending slot must not publish.
+        assert!(
+            delta_rx.try_recv().is_err(),
+            "Fix-B CommitConfirmed: pending RegisterPeer must not fire a roster delta"
+        );
+
+        // CommitConfirmed: triggers commit_peer + broadcast_control in the arm.
+        client
+            .send_frame(MeshStreamFrame::Data {
+                fenced,
+                payload: encode_control(&HuddleControlMsg::CommitConfirmed {
+                    pubkey: "bob".into(),
+                })
+                .unwrap(),
+            })
+            .await
+            .unwrap();
+
+        // Alice's ctrl channel receives the joined broadcast.
+        let ctrl_msg = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            alice_ctrl_rx.recv(),
+        )
+        .await
+        .expect(
+            "Fix-B CommitConfirmed: alice ctrl_rx must receive joined broadcast within 2s\n\
+             Mutation oracle B: comment out broadcast_control in CommitConfirmed arm → timeout → RED",
+        )
+        .expect("Fix-B CommitConfirmed: alice ctrl channel closed");
+        let crate::audio::room::PeerCtrl::Json(joined_json) = ctrl_msg else {
+            panic!("Fix-B CommitConfirmed: expected Json ctrl message, got Close");
+        };
+        let joined: serde_json::Value = serde_json::from_str(&joined_json).unwrap();
+        assert_eq!(
+            joined["type"], "joined",
+            "Fix-B CommitConfirmed: broadcast must be a joined message"
+        );
+        assert_eq!(
+            joined["pubkey"], "bob",
+            "Fix-B CommitConfirmed: broadcast must name the committed peer"
+        );
+
+        // Roster delta channel fires once with a strictly increasing revision.
+        let delta = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            delta_rx.recv().await
+        })
+        .await
+        .expect(
+            "Fix-B CommitConfirmed: roster delta must arrive within 2s\n\
+             Mutation oracle A: comment out commit_peer in CommitConfirmed arm → no delta → \
+             timeout → RED",
+        )
+        .unwrap_or_else(|e| panic!("Fix-B CommitConfirmed: delta channel error: {e:?}"));
+        assert!(
+            delta.revision > pre_bob_revision,
+            "Fix-B CommitConfirmed: delta revision ({}) must be > pre-admission revision ({})",
+            delta.revision,
+            pre_bob_revision
+        );
+        assert_eq!(
+            delta.joined.as_ref().map(|p| p.pubkey.as_str()),
+            Some("bob"),
+            "Fix-B CommitConfirmed: delta must be a joined event for bob"
+        );
+
+        // Exactly one delta (no spurious extra).
+        assert!(
+            delta_rx.try_recv().is_err(),
+            "Fix-B CommitConfirmed: exactly one delta must fire from commit_peer"
+        );
+
+        client.finish().unwrap();
+        drop(client);
+        served.await.unwrap().unwrap();
     }
 }

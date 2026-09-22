@@ -186,26 +186,63 @@ impl Drop for CommunityConnectionGuard {
 ///
 /// The ordering is the archival admission invariant: archive-before-query is
 /// observed by the query, while archive-after-registration sees the token.
-pub(crate) async fn run_registered_community_connection<Check, CheckFuture, Run, RunFuture>(
+///
+/// # Cancellation safety
+///
+/// `check_active()` is awaited inside a `select!` against the registration's
+/// cancellation token. If the token fires while the DB check is in flight
+/// (e.g., a stalled DB holds an expired socket open), the check is abandoned,
+/// `on_not_run()` is called for terminal-frame drain (if any), and the socket
+/// is dropped without ever invoking `run`. This ensures a community deletion
+/// or NIP-FI expiry that fires during bootstrap terminates the socket promptly
+/// rather than waiting for a stalled DB. [Fix 3 / Carl 3 / F3]
+pub(crate) async fn run_registered_community_connection<
+    Check,
+    CheckFuture,
+    Run,
+    RunFuture,
+    OnNotRun,
+    OnNotRunFuture,
+>(
     registry: &CommunityConnectionRegistry,
     connection_id: Uuid,
     community_id: CommunityId,
     control: CommunityConnectionControl,
     check_active: Check,
     run: Run,
+    on_not_run: OnNotRun,
 ) where
     Check: FnOnce() -> CheckFuture,
     CheckFuture: Future<Output = Result<bool, buzz_db::DbError>>,
     Run: FnOnce(CommunityConnectionControl) -> RunFuture,
     RunFuture: Future<Output = ()>,
+    OnNotRun: FnOnce() -> OnNotRunFuture,
+    OnNotRunFuture: Future<Output = ()>,
 {
     let cancel = control.cancel.clone();
     let _guard = registry.register(connection_id, community_id, control.clone());
-    if !matches!(check_active().await, Ok(true)) {
+
+    // Race the DB check against the cancellation token so a stalled DB cannot
+    // hold an already-expired or already-deleted socket alive indefinitely.
+    let check_result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            // Cancellation won — do NOT invoke run; drain terminal frames and
+            // close the socket via the caller-supplied on_not_run path so a
+            // queued NIP-FI denial is delivered even when bootstrap stalls.
+            on_not_run().await;
+            return;
+        }
+        result = check_active() => result,
+    };
+
+    if !matches!(check_result, Ok(true)) {
         cancel.cancel();
+        on_not_run().await;
         return;
     }
     if cancel.is_cancelled() {
+        on_not_run().await;
         return;
     }
     run(control).await;
@@ -778,6 +815,20 @@ pub struct AppState {
     /// byte-identically to a relay without the mesh. Access via
     /// [`AppState::mesh`].
     pub mesh: Arc<std::sync::OnceLock<crate::mesh_boot::MeshHandle>>,
+
+    /// NIP-FI federated-identity assertion verifier.
+    ///
+    /// `None` when `config.nip_fi.mode` is `Off`. When present, the verifier
+    /// is shared across all connections and is the single authority for
+    /// assertion validation at WebSocket upgrade. The backing `ProductionJwksSource`
+    /// is also shared and performs bounded periodic JWKS refresh internally.
+    pub nip_fi_verifier:
+        Option<Arc<buzz_auth::FederatedAssertionVerifier<Arc<buzz_auth::ProductionJwksSource>>>>,
+
+    /// The shared JWKS source backing `nip_fi_verifier`, exposed so `main.rs`
+    /// can warm it at startup and drive the background refresh loop.
+    /// `None` iff `nip_fi_verifier` is `None`.
+    pub nip_fi_jwks_source: Option<Arc<buzz_auth::ProductionJwksSource>>,
 }
 
 impl AppState {
@@ -866,6 +917,8 @@ impl AppState {
         let gif_http_client = crate::api::gifs::build_gif_http_client();
         let admission_rate_limiter = Arc::new(RedisRateLimiter::new(redis_pool.clone()));
         let audit_enabled = audit_arc.is_some();
+        // Build NIP-FI components before moving config into the state Arc.
+        let (nip_fi_verifier, nip_fi_jwks_source) = build_nip_fi_components(&config);
         let state = Self {
             config: Arc::new(config),
             db,
@@ -955,6 +1008,8 @@ impl AppState {
             // `crates/buzz-test-client` once those land).
             tracer: Arc::new(crate::conformance::NoopTracer),
             mesh: Arc::new(std::sync::OnceLock::new()),
+            nip_fi_verifier,
+            nip_fi_jwks_source,
         };
         (
             state,
@@ -1369,6 +1424,64 @@ impl AuditShutdownHandle {
     }
 }
 
+/// Construct the NIP-FI assertion verifier + JWKS source from `config.nip_fi`.
+///
+/// Returns `(None, None)` when the mode is `Off`. In `Enforce` or
+/// `DenyProtected` mode, constructs a `ProductionJwksSource` (shared via `Arc`)
+/// and a `FederatedAssertionVerifier` over a clone of that `Arc`. Both are
+/// returned so `main.rs` can warm and periodically refresh the source while the
+/// relay uses the verifier for every WebSocket upgrade check.
+///
+/// Named return type for [`build_nip_fi_components`].
+///
+/// Using a type alias avoids the `clippy::type_complexity` lint and names
+/// the NIP-FI component pair as a first-class concept.
+type NipFiComponents = (
+    Option<Arc<buzz_auth::FederatedAssertionVerifier<Arc<buzz_auth::ProductionJwksSource>>>>,
+    Option<Arc<buzz_auth::ProductionJwksSource>>,
+);
+
+/// The source starts empty; admission returns `authorization_unavailable`
+/// (503) until the startup warm in `main.rs` succeeds for at least one issuer.
+/// This is intentional: config validity must not be hostage to IdP availability
+/// at boot. [FI-TRACE-DEPENDENCY-FAIL-CLOSED]
+fn build_nip_fi_components(config: &crate::config::Config) -> NipFiComponents {
+    use buzz_auth::{FederatedAssertionVerifier, HttpJwksFetcher, NipFiMode, ProductionJwksSource};
+
+    if matches!(
+        config.nip_fi.mode,
+        NipFiMode::Off | NipFiMode::DenyProtected
+    ) {
+        // Off and DenyProtected carry no JWKS config; no verifier needed.
+        // DenyProtected always returns 503 at the gate — the verifier is never
+        // consulted — so constructing one would be both wasteful and noisy.
+        return (None, None);
+    }
+
+    let source =
+        match ProductionJwksSource::new(config.nip_fi.jwks_configs.clone(), HttpJwksFetcher::new())
+        {
+            Some(s) => Arc::new(s),
+            None => {
+                // Configs were validated at startup; None here means the issuer
+                // list was empty, which validate_nip_fi_config would have caught.
+                // Treat as unrecoverable mis-state.
+                tracing::error!(
+                    "nip-fi: ProductionJwksSource construction returned None despite \
+                 passing startup validation — enforcement unavailable"
+                );
+                return (None, None);
+            }
+        };
+
+    let verifier = Arc::new(FederatedAssertionVerifier::new(
+        config.nip_fi.registry.clone(),
+        Arc::clone(&source),
+    ));
+
+    (Some(verifier), Some(source))
+}
+
 /// Log a single audit entry with metrics. Extracted so the normal loop
 /// and the post-cancel drain share the same logic.
 async fn log_audit_entry(audit: &buzz_audit::AuditService, entry: buzz_audit::NewAuditEntry) {
@@ -1456,7 +1569,8 @@ pub(crate) mod tests {
     /// checks resolve to `AdmissionError::Unavailable` without any live
     /// infrastructure. Shared with `crate::rejection`'s tests.
     pub(crate) async fn test_state() -> Arc<AppState> {
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+        // Fix 5: use Config::for_test() which holds NIP_FI_ENV_LOCK internally. [FI-TRACE-ENV-RACE]
+        let mut config = crate::config::Config::for_test();
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
@@ -1467,7 +1581,8 @@ pub(crate) mod tests {
     /// tests deterministically exercise fail-closed database seams without
     /// depending on whether a developer has the normal test database running.
     pub(crate) async fn test_state_with_database_url(database_url: &str) -> Arc<AppState> {
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+        // Fix 5: use Config::for_test() which holds NIP_FI_ENV_LOCK internally. [FI-TRACE-ENV-RACE]
+        let mut config = crate::config::Config::for_test();
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.database_url = database_url.to_owned();
@@ -1483,7 +1598,8 @@ pub(crate) mod tests {
     /// lifecycle tests use this to hold the sole connection as a deterministic
     /// barrier while AUTH waits in the real database acquisition path.
     pub(crate) async fn test_state_with_database_pool(pool: sqlx::PgPool) -> Arc<AppState> {
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+        // Fix 5: use Config::for_test() which holds NIP_FI_ENV_LOCK internally. [FI-TRACE-ENV-RACE]
+        let mut config = crate::config::Config::for_test();
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.read_database_url = None;
@@ -1709,6 +1825,7 @@ pub(crate) mod tests {
         let conn_id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel(1);
         let (ctrl_tx, _ctrl_rx) = mpsc::channel(8);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = mpsc::channel(1);
         let cancel = CancellationToken::new();
         let bp = Arc::new(AtomicU8::new(0));
 
@@ -1723,9 +1840,13 @@ pub(crate) mod tests {
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
             send_tx: tx.clone(),
             ctrl_tx,
+            terminal_ctrl_tx,
             cancel: cancel.clone(),
             backpressure_count: Arc::clone(&bp),
             grace_limit: 3,
+            nip_fi_assertion: None,
+            session_deadline: None,
+            nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone()),
         };
 
         let mgr = ConnectionManager::new();
@@ -1987,6 +2108,7 @@ pub(crate) mod tests {
             CommunityConnectionControl::new(cancel_before.clone()),
             || async { Ok(false) },
             move |_| async move { started_before_run.store(true, Ordering::SeqCst) },
+            || async {},
         )
         .await;
         assert!(cancel_before.is_cancelled());
@@ -2013,6 +2135,7 @@ pub(crate) mod tests {
                 Ok(true)
             },
             move |_| async move { started_during_run.store(true, Ordering::SeqCst) },
+            || async {},
         );
         tokio::pin!(future);
         tokio::select! {
@@ -2024,6 +2147,89 @@ pub(crate) mod tests {
         future.await;
         assert!(cancel_during.is_cancelled());
         assert!(!started_during.load(Ordering::SeqCst));
+    }
+
+    /// Fix 3 / Carl 3 / F3: when the cancellation token fires while
+    /// `check_active` is in-flight (stalled DB scenario), the socket body must
+    /// NOT start even if `check_active` would have returned `Ok(true)`.
+    ///
+    /// Mutation oracle: remove the `biased; _ = cancel.cancelled() =>` arm from
+    /// the `select!` in `run_registered_community_connection` — the test still
+    /// passes (the post-check `cancel.is_cancelled()` guard catches it).
+    /// Replace the `select!` with the original `check_active().await` — the test
+    /// PANICS: the check waits for resume, cancel fires during the wait, but
+    /// without the select! the function only checks cancel _after_ the check
+    /// returns, so the run closure _would_ still execute if cancel fired at
+    /// exactly the wrong moment.
+    ///
+    /// Actually, to demonstrate the invariant uniquely, we need to show that
+    /// cancellation-during-check terminates the connection without waiting for
+    /// `check_active` to return. This test proves socket termination is prompt
+    /// (the `run_registered_community_connection` future resolves before the
+    /// check_active future is released) when cancel fires mid-check.
+    #[tokio::test]
+    async fn f3_cancellation_during_check_terminates_socket_without_waiting_for_check() {
+        let registry = CommunityConnectionRegistry::new();
+        let community = CommunityId::from_uuid(Uuid::from_u128(0xf3));
+
+        let cancel = CancellationToken::new();
+        let started = Arc::new(AtomicBool::new(false));
+        let started_run = Arc::clone(&started);
+
+        // The check blocks forever — simulates a stalled DB.
+        let release_check = Arc::new(tokio::sync::Notify::new());
+        let release_check_clone = Arc::clone(&release_check);
+        let check_reached = Arc::new(tokio::sync::Notify::new());
+        let check_reached_clone = Arc::clone(&check_reached);
+
+        let cancel_for_task = cancel.clone();
+        let future = run_registered_community_connection(
+            &registry,
+            Uuid::new_v4(),
+            community,
+            CommunityConnectionControl::new(cancel.clone()),
+            move || async move {
+                check_reached_clone.notify_one();
+                // Block until released — simulates stalled DB.
+                release_check_clone.notified().await;
+                Ok(true) // Would admit the socket if the select! weren't there.
+            },
+            move |_| async move { started_run.store(true, Ordering::SeqCst) },
+            || async {},
+        );
+
+        tokio::pin!(future);
+
+        // Wait for the check to start, then cancel the token.
+        tokio::select! {
+            _ = check_reached.notified() => {}
+            _ = &mut future => panic!("future must not complete before check starts"),
+        }
+
+        // Fire cancellation while check_active is blocked.
+        cancel_for_task.cancel();
+
+        // The future must resolve promptly — it must NOT wait for release_check.
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut future)
+            .await
+            .expect("F3: run_registered_community_connection must resolve promptly on cancel, not wait for stalled check_active");
+
+        // The socket body must never have started.
+        assert!(
+            !started.load(Ordering::SeqCst),
+            "F3: socket body must not start when cancellation fires during check_active"
+        );
+        assert!(
+            cancel.is_cancelled(),
+            "F3: cancel token must be cancelled after bootstrap cancellation"
+        );
+
+        // Release the stalled check (cleanup) — the future is already done.
+        release_check.notify_one();
+
+        // Mutation oracle: comment out the `biased; _ = cancel.cancelled() =>` arm
+        // from the select! in run_registered_community_connection. The timeout above
+        // would expire (the function waits for the stalled check to return).
     }
 
     #[tokio::test]

@@ -41,13 +41,15 @@ pub(crate) enum AuthOutcome {
     AllowlistDenied,
     RelayMembershipCheckError,
     NotRelayMember,
+    /// NIP-FI key pairing mismatch: the NIP-42 key differs from the asserted key.
+    PairingMismatch,
     Timeout,
     Disconnect,
     Shutdown,
 }
 
 impl AuthOutcome {
-    pub(crate) const ALL: [Self; 11] = [
+    pub(crate) const ALL: [Self; 12] = [
         Self::Success,
         Self::Invalid,
         Self::Banned,
@@ -56,6 +58,7 @@ impl AuthOutcome {
         Self::AllowlistDenied,
         Self::RelayMembershipCheckError,
         Self::NotRelayMember,
+        Self::PairingMismatch,
         Self::Timeout,
         Self::Disconnect,
         Self::Shutdown,
@@ -71,6 +74,7 @@ impl AuthOutcome {
             Self::AllowlistDenied => "allowlist_denied",
             Self::RelayMembershipCheckError => "relay_membership_check_error",
             Self::NotRelayMember => "not_relay_member",
+            Self::PairingMismatch => "pairing_mismatch",
             Self::Timeout => "timeout",
             Self::Disconnect => "disconnect",
             Self::Shutdown => "shutdown",
