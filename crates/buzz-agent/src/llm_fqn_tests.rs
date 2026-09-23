@@ -54,3 +54,55 @@ async fn gpt_fqn_completion_and_summary_use_responses() {
     assert_eq!(completion["tools"][0]["name"], "test_tool");
     assert_eq!(posts[1].body.as_ref().unwrap()["max_output_tokens"], 128);
 }
+
+#[tokio::test]
+async fn claude_fqn_completion_and_summary_use_anthropic_messages() {
+    let response = json!({
+        "content": [{"type": "text", "text": "ok"}],
+        "stop_reason": "end_turn"
+    });
+    let (base_url, captured) = spawn_sequence_stub(vec![
+        StubHttpResponse::ok(response.clone()),
+        StubHttpResponse::ok(response),
+    ])
+    .await;
+    let mut config = cfg(Provider::DatabricksV2);
+    config.base_url = base_url;
+    config.thinking_effort = Some(ThinkingEffort::High);
+    let model = "data_workflow_tools.goose.goose-claude-opus-5-5";
+    let llm = Llm::new(&config).unwrap();
+
+    assert_eq!(
+        llm.complete(
+            &config,
+            "system",
+            &[HistoryItem::User("hello".into())],
+            &[],
+            model,
+        )
+        .await
+        .unwrap()
+        .text,
+        "ok"
+    );
+    assert_eq!(
+        llm.summarize(&config, "system", "history", 128, model)
+            .await
+            .unwrap(),
+        "ok"
+    );
+
+    let requests = captured.lock().await;
+    let posts: Vec<_> = requests.iter().filter(|r| r.method == "POST").collect();
+    assert_eq!(posts.len(), 2);
+    for request in &posts {
+        assert_eq!(request.path, "/v1/ai-gateway/anthropic/v1/messages");
+        let body = request.body.as_ref().unwrap();
+        assert_eq!(body["model"], model);
+        assert!(body.get("reasoning_effort").is_none());
+    }
+    let completion = posts[0].body.as_ref().unwrap();
+    assert!(completion.get("thinking").is_none());
+    assert!(completion.get("output_config").is_none());
+    assert_eq!(posts[1].body.as_ref().unwrap()["max_tokens"], 128);
+}

@@ -25,10 +25,10 @@ const corpus = JSON.parse(readFileSync(fileURLToPath(corpusUrl), "utf8"));
 // (`_group`) are skipped. Mirrors the Rust corpus filter.
 const executable = corpus.filter((entry) => entry.expect != null);
 
-test("corpus has exactly 158 executable vectors", () => {
+test("corpus has exactly 159 executable vectors", () => {
   // Locks the vector count so a silent corpus edit can't quietly drop coverage;
   // must equal the gate in the Rust suite (model_capabilities.rs).
-  assert.equal(executable.length, 158);
+  assert.equal(executable.length, 159);
 });
 
 test("registry label aliases refuse an unprefixed query", () => {
@@ -93,13 +93,23 @@ test("registry label aliases refuse ambiguous stripped record keys", () => {
   );
 });
 
-test("Unity Catalog FQNs use neutral concrete-unknown capabilities", () => {
-  const fqn = resolveModelCapabilities("databricks_v2", "system.ai.kimi-k3");
+test("Unity Catalog FQNs resolve capabilities from the service component", () => {
+  const claude = resolveModelCapabilities(
+    "databricks_v2",
+    "data_workflow_tools.goose.goose-claude-opus-5-5",
+  );
+  assert.equal(claude.databricksV2WireRoute, "anthropic-messages");
+  assert.equal(claude.thinkingMode, "none");
+
+  const unknown = resolveModelCapabilities(
+    "databricks_v2",
+    "system.ai.kimi-k3",
+  );
   const fallback = resolveModelCapabilities(
     "databricks_v2",
     "some-unknown-xyz",
   );
-  assert.deepEqual(fqn, fallback);
+  assert.deepEqual(unknown, fallback);
 });
 
 test("every executable corpus vector resolves to its expected six-axis profile", () => {

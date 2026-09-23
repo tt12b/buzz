@@ -302,7 +302,16 @@ function isDatabricksModelServiceFqn(model: string): boolean {
   );
 }
 
-// Mirror fqn_requires_responses: routing is the only inferred FQN capability.
+// Mirror the FQN route helpers: routing is the only inferred capability.
+function fqnRequiresAnthropicMessages(model: string): boolean {
+  const service = model.split(".").at(-1) ?? "";
+  const stripped = stripCatalogPrefix(
+    service.toLowerCase(),
+    MANIFEST.family_tokens,
+  );
+  return stripped.startsWith("claude-");
+}
+
 function fqnRequiresResponses(model: string): boolean {
   const service = model.split(".").at(-1) ?? "";
   const stripped = stripCatalogPrefix(
@@ -328,8 +337,8 @@ export function resolveModelCapabilities(
 ): CapabilityResult {
   const canon = canonicalizeProvider(provider);
   const blank = rawModelId.trim().length === 0;
-  // FQNs keep neutral effort capabilities; only GPT-5+ service names
-  // select Responses. Catalog/schema names never choose the protocol.
+  // FQNs preserve their complete request identity, but capability matching only
+  // inspects the service component. Catalog and schema names are metadata.
   const modelServiceFqn =
     canon === "databricks_v2" && isDatabricksModelServiceFqn(rawModelId);
 
@@ -383,10 +392,26 @@ export function resolveModelCapabilities(
   // 3. Provider fallback (blank vs. concrete-unknown); never carries a label.
   const pair = fallbackPair(canon);
   const state = blank ? pair.blank : pair.concrete_unknown;
-  const route =
-    modelServiceFqn && fqnRequiresResponses(rawModelId)
+  const fqnAnthropicMessages =
+    modelServiceFqn && fqnRequiresAnthropicMessages(rawModelId);
+  const route = fqnAnthropicMessages
+    ? "anthropic-messages"
+    : modelServiceFqn && fqnRequiresResponses(rawModelId)
       ? "openai-responses"
       : state.databricks_v2_wire_route;
+  if (fqnAnthropicMessages) {
+    // Route inference does not prove thinking support. Expose no choices so
+    // the picker cannot promise effort controls the request will discard.
+    return toResult(
+      {
+        ...state,
+        supported_efforts: [],
+        default_effort: null,
+      },
+      route,
+      null,
+    );
+  }
   return toResult(state, route, null);
 }
 

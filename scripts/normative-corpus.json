@@ -2348,8 +2348,21 @@
     }
   },
   {
-    "_group": "Databricks FQN GPT-5+ Responses routing",
-    "_note": "Only the service component selects Responses; effort capabilities remain neutral."
+    "_group": "Databricks FQN service capability routing",
+    "_note": "Only the service component selects capabilities; catalog/schema components remain inert."
+  },
+  {
+    "id": "dbv2-fqn-claude-anthropic-0",
+    "provider": "databricks_v2",
+    "raw_model_id": "data_workflow_tools.goose.goose-claude-opus-5-5",
+    "expect": {
+      "thinking_mode": "none",
+      "supported_efforts": [],
+      "default_effort": null,
+      "databricks_v2_wire_route": "anthropic-messages",
+      "normalization_policy": "openai-clamp-max-to-xhigh",
+      "registry_label": null
+    }
   },
   {
     "id": "dbv2-fqn-responses-0",
@@ -2497,16 +2510,9 @@
     "raw_model_id": "catalog.schema.claude-gpt-6",
     "expect": {
       "thinking_mode": "none",
-      "supported_efforts": [
-        "none",
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "xhigh"
-      ],
-      "default_effort": "medium",
-      "databricks_v2_wire_route": "mlflow-chat",
+      "supported_efforts": [],
+      "default_effort": null,
+      "databricks_v2_wire_route": "anthropic-messages",
       "normalization_policy": "openai-clamp-max-to-xhigh",
       "registry_label": null
     }

@@ -308,6 +308,14 @@ pub(crate) fn is_databricks_model_service_fqn(model: &str) -> bool {
     }) && components.next().is_none()
 }
 
+fn fqn_requires_anthropic_messages(model: &str) -> bool {
+    let Some(service) = model.rsplit('.').next() else {
+        return false;
+    };
+    let lower = service.to_ascii_lowercase();
+    strip_catalog_prefix(&lower, &manifest().family_tokens).starts_with("claude-")
+}
+
 /// Route GPT-5+ UC services to Responses without borrowing endpoint effort facts.
 /// Match the first family token in the service only, preserving the existing
 /// boundary semantics (e.g. `claude-gpt-5` is not a GPT service).
@@ -334,9 +342,8 @@ pub fn resolve(provider: &str, raw_model_id: &str) -> CapabilityResult {
     let canon = canonical_provider(provider);
     let blank = raw_model_id.trim().is_empty();
 
-    // FQNs keep neutral effort capabilities, but GPT-5+ service names need
-    // Responses for tools with reasoning. Only inspect the service component:
-    // catalog/schema names must never choose a model protocol.
+    // FQNs preserve their complete request identity, but capability matching only
+    // inspects the service component. Catalog and schema names are metadata.
     let model_service_fqn =
         canon == "databricks_v2" && is_databricks_model_service_fqn(raw_model_id);
 
@@ -409,11 +416,25 @@ pub fn resolve(provider: &str, raw_model_id: &str) -> CapabilityResult {
     } else {
         &pair.concrete_unknown
     };
+    let fqn_anthropic_messages = model_service_fqn && fqn_requires_anthropic_messages(raw_model_id);
     CapabilityResult {
+        // Route inference does not prove thinking support. Expose no choices
+        // for an unverified Claude FQN so clients cannot advertise controls
+        // that the request builder will discard.
         thinking_mode: state.thinking_mode,
-        supported_efforts: &state.supported_efforts,
-        default_effort: state.default_effort,
-        databricks_v2_wire_route: if model_service_fqn && fqn_requires_responses(raw_model_id) {
+        supported_efforts: if fqn_anthropic_messages {
+            &[]
+        } else {
+            &state.supported_efforts
+        },
+        default_effort: if fqn_anthropic_messages {
+            None
+        } else {
+            state.default_effort
+        },
+        databricks_v2_wire_route: if fqn_anthropic_messages {
+            DatabricksV2Route::AnthropicMessages
+        } else if model_service_fqn && fqn_requires_responses(raw_model_id) {
             DatabricksV2Route::OpenaiResponses
         } else {
             state.databricks_v2_wire_route
@@ -747,7 +768,8 @@ mod tests {
     Q::Vector { id: "boundary-claude-3-digit-run-anthropic-probe", provider: "anthropic", raw_model_id: "claude-35", note: Some("Probes whether the claude-3 prefix binds a longer digit run ('35').") },
     Q::Vector { id: "boundary-claude-opus-4-70-anthropic-probe", provider: "anthropic", raw_model_id: "claude-opus-4-70", note: Some("Probes whether the claude-opus-4-7 prefix binds a longer digit run ('70').") },
     Q::Vector { id: "boundary-gpt-5-1234-openai-probe", provider: "openai", raw_model_id: "gpt-5-1234", note: Some("Probes a 4-digit run after the gpt-5 stem.") },
-    Q::Section { group: "Databricks FQN GPT-5+ Responses routing", note: Some("Only the service component selects Responses; effort capabilities remain neutral.") },
+    Q::Section { group: "Databricks FQN service capability routing", note: Some("Only the service component selects capabilities; catalog/schema components remain inert.") },
+    Q::Vector { id: "dbv2-fqn-claude-anthropic-0", provider: "databricks_v2", raw_model_id: "data_workflow_tools.goose.goose-claude-opus-5-5", note: None },
     Q::Vector { id: "dbv2-fqn-responses-0", provider: "databricks_v2", raw_model_id: "catalog.schema.goose-gpt-6-astra", note: None },
     Q::Vector { id: "dbv2-fqn-responses-1", provider: "databricks_v2", raw_model_id: "catalog.schema.goose-gpt-5", note: None },
     Q::Vector { id: "dbv2-fqn-responses-2", provider: "databricks_v2", raw_model_id: "catalog.schema.gpt-5-5", note: None },
@@ -886,7 +908,7 @@ mod tests {
     }
 
     #[test]
-    fn corpus_has_exactly_158_executable_vectors() {
+    fn corpus_has_exactly_159_executable_vectors() {
         // Locks the vector count so a silent INPUTS edit can't quietly drop
         // coverage; must equal the gate in the TS harness
         // (modelCapabilitiesCorpus.test.mjs).
@@ -895,7 +917,7 @@ mod tests {
             .filter(|q| matches!(q, Q::Vector { .. }))
             .count();
         assert_eq!(
-            vectors, 158,
+            vectors, 159,
             "corpus executable-vector count changed; update this gate deliberately"
         );
     }
@@ -965,8 +987,9 @@ mod tests {
     }
 
     #[test]
-    fn test_every_resolve_yields_a_complete_result() {
-        // Complete-result invariant: supported_efforts is never empty on any path.
+    fn test_manifest_and_fallback_resolves_have_effort_choices() {
+        // Manifest records and provider fallbacks always expose choices. A
+        // route-only FQN may intentionally expose none when support is unverified.
         let inputs = [
             ("anthropic", "claude-opus-4-7"),
             ("anthropic", ""),
